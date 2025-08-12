@@ -1,5 +1,5 @@
 
-# nanoGPT
+# nanoGPT with Iron RoPE
 A test repo for Fourier Extended RoPE / Iron Rope
 — Simple explanation —
 Rotate q/k channel pairs by multi‑dimensional Fourier phases θ = W·p (p = token coords), so attention scores depend on relative geometry Δp as well as content—this is RoPE generalized from 1‑D to d‑D.
