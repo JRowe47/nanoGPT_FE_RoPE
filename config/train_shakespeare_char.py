@@ -35,3 +35,11 @@ warmup_iters = 100 # not super necessary potentially
 # on macbook also add
 # device = 'cpu'  # run on cpu only
 # compile = False # do not torch compile the model
+model_args.update(dict(
+    use_iron_rope=True,   # turn on the rotation
+    rope_m=64,            # rotated pairs per head (will be clipped to head_dim//2)
+    rope_coord_dim=1,     # 1-D sequence
+    rope_freq_kind="log", # RoPE-like log bands; try "gaussian" for RFF flavor
+    rope_base=10000.0,
+    rope_sigma=1.0,
+))
