@@ -15,6 +15,54 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+def _ironrope_make_W(d, m, kind="log", base=10000.0, sigma=1.0, device=None, dtype=None):
+    """Frequency bank W ∈ R^{m×d}. 'log' gives classic RoPE-like bands; 'gaussian' gives RFF-style rows."""
+    if m == 0:
+        return torch.empty(0, d, device=device, dtype=dtype)
+    if kind == "log":
+        # allocate evenly across axes, frequencies in [1/base, 1]
+        m_per_axis = max(1, m // d)
+        rows = []
+        for ax in range(d):
+            freqs = torch.logspace(
+                start=math.log(1.0 / base), end=0.0, steps=m_per_axis, base=math.e,
+                device=device, dtype=dtype or torch.float32
+            )
+            block = torch.zeros(m_per_axis, d, device=device, dtype=dtype or torch.float32)
+            block[:, ax] = freqs
+            rows.append(block)
+        W = torch.cat(rows, dim=0)
+        if W.shape[0] < m:  # pad if not divisible
+            extra = m - W.shape[0]
+            freqs = torch.logspace(
+                start=math.log(1.0 / base), end=0.0, steps=extra, base=math.e,
+                device=device, dtype=dtype or torch.float32
+            )
+            block = torch.zeros(extra, d, device=device, dtype=dtype or torch.float32)
+            block[:, -1] = freqs
+            W = torch.cat([W, block], dim=0)
+        return W  # [m,d]
+    elif kind == "gaussian":
+        return torch.randn(m, d, device=device, dtype=dtype or torch.float32) * sigma
+    else:
+        raise ValueError(f"unknown freq kind: {kind}")
+
+def _ironrope_apply(x, cos_th, sin_th, m):
+    """Rotate first 2m channels of x by angle arrays (per-token), leave the rest unchanged.
+       x: [B,H,T,Dh], cos_th/sin_th: [T,m]"""
+    if m == 0:
+        return x
+    B, H, T, Dh = x.shape
+    rot = x[..., :2*m].contiguous().view(B, H, T, m, 2)
+    pas = x[..., 2*m:]
+    c = cos_th[None, None, :, :].expand(B, H, T, m)
+    s = sin_th[None, None, :, :].expand(B, H, T, m)
+    x0, x1 = rot[..., 0], rot[..., 1]
+    y0 = x0 * c - x1 * s
+    y1 = x0 * s + x1 * c
+    y = torch.stack((y0, y1), dim=-1).view(B, H, T, 2*m)
+    return torch.cat((y, pas), dim=-1)
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -41,6 +89,29 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        # ---- Fourier-extended RoPE (iron RoPE) ----
+        self.use_iron_rope = getattr(config, "use_iron_rope", True)  # toggle
+        self.rope_coord_dim = getattr(config, "rope_coord_dim", 1)   # 1 for Tiny Shakespeare
+        self.rope_m_req = getattr(config, "rope_m", 64)              # rotation pairs per head (will be clipped)
+        self.rope_freq_kind = getattr(config, "rope_freq_kind", "log")  # "log" or "gaussian"
+        self.rope_base = getattr(config, "rope_base", 10000.0)
+        self.rope_sigma = getattr(config, "rope_sigma", 1.0)
+
+        # use at most half the head dim for rotation channels
+        self.rope_m = 0
+        if self.use_iron_rope:
+            self.rope_m = min(self.head_dim // 2, max(0, int(self.rope_m_req)))
+        
+        # frequency bank W (shared across heads; simplest/fastest)
+        if self.use_iron_rope and self.rope_m > 0:
+            W = _ironrope_make_W(
+                d=self.rope_coord_dim, m=self.rope_m,
+                kind=self.rope_freq_kind, base=self.rope_base, sigma=self.rope_sigma
+            )
+            self.register_buffer("iron_W", W, persistent=True)   # [m,d]
+        else:
+            self.iron_W = None
+
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -57,8 +128,24 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # q,k,v are [B,H,T,head_dim] here
+        if self.use_iron_rope and (self.iron_W is not None) and (self.rope_m > 0):
+            # default 1-D coordinates: positions 0..T-1
+            coords = torch.arange(T, device=x.device, dtype=torch.float32).unsqueeze(-1)  # [T,1]
+            if self.rope_coord_dim > 1:
+                # pad extra dims with zeros (upgrade later for (x,y,...) if you want)
+                extra = torch.zeros(T, self.rope_coord_dim - 1, device=x.device, dtype=torch.float32)
+                coords = torch.cat([coords, extra], dim=-1)  # [T,d]
+        
+            # phases Θ = coords @ W^T -> [T,m]
+            Theta = coords @ self.iron_W.to(coords.dtype).T
+            cos_th = torch.cos(Theta).to(q.dtype)
+            sin_th = torch.sin(Theta).to(q.dtype)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+            # rotate first 2*m channels of q,k
+            q = _ironrope_apply(q, cos_th, sin_th, self.rope_m)
+            k = _ironrope_apply(k, cos_th, sin_th, self.rope_m)
+                # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
