@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
+
 def _ironrope_make_W(d, m, kind="log", base=10000.0, sigma=1.0, device=None, dtype=None):
     """Frequency bank W ∈ R^{m×d}. 'log' gives classic RoPE-like bands; 'gaussian' gives RFF-style rows."""
     if m == 0:
@@ -89,6 +91,11 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.n_head = config.n_head
+        # pick one canonical name and define both for compatibility
+        self.head_dim  = config.n_embd // config.n_head
+        self.head_size = self.head_dim
+
         # ---- Fourier-extended RoPE (iron RoPE) ----
         self.use_iron_rope = getattr(config, "use_iron_rope", True)  # toggle
         self.rope_coord_dim = getattr(config, "rope_coord_dim", 1)   # 1 for Tiny Shakespeare
